@@ -16,6 +16,7 @@
 */
 
 #include <cstring>
+#include <vector>
 #include <gtest/gtest.h>
 
 #include <gz/msgs/laserscan.pb.h>
@@ -998,6 +999,66 @@ TEST_P(GpuLidarSensorTest, Topic)
 {
   gz::common::Console::SetVerbosity(4);
   Topic(GetParam());
+}
+
+/////////////////////////////////////////////////
+/// \brief A sensor type derived from GpuLidarSensor: its Update() may run
+/// code before it renders, so it does not render ahead.
+class DerivedGpuLidarSensor : public gz::sensors::GpuLidarSensor
+{
+};
+
+/////////////////////////////////////////////////
+TEST_P(GpuLidarSensorTest, RenderAheadOnlyExactType)
+{
+  const std::string renderEngine = GetParam();
+  if (renderEngine != "ogre2")
+  {
+    GTEST_SKIP() << "Engine '" << renderEngine << "' is not tested here";
+  }
+  auto *engine = gz::rendering::engine(renderEngine);
+  if (!engine)
+  {
+    GTEST_SKIP() << "Engine '" << renderEngine << "' is not supported";
+  }
+  gz::rendering::ScenePtr scene = engine->CreateScene("scene_render_ahead");
+  ASSERT_NE(nullptr, scene);
+
+  // (a camera name is unique in the scene)
+  auto lidarSdf = [](const std::string &_name)
+  {
+    return GpuLidarToSdf(_name, gz::math::Pose3d::Zero, 30,
+        "/gz/sensors/test/" + _name, 64, 1, -0.5, 0.5, 1, 1, 0, 0, 0.01,
+        0.08, 10.0, true, false, _name + "_frame");
+  };
+
+  gz::sensors::Manager mgr;
+  auto *base = mgr.CreateSensor<gz::sensors::GpuLidarSensor>(
+      lidarSdf("render_ahead_base"));
+  auto *derived = mgr.CreateSensor<DerivedGpuLidarSensor>(
+      lidarSdf("render_ahead_derived"));
+  ASSERT_NE(nullptr, base);
+  ASSERT_NE(nullptr, derived);
+  // (Sensor::Update(_now, _force) is hidden in the sensor types)
+  const std::vector<gz::sensors::RenderingSensor *> sensors{base, derived};
+  for (gz::sensors::RenderingSensor *sensor : sensors)
+  {
+    sensor->SetScene(scene);
+    sensor->SetManualSceneUpdate(true);
+  }
+
+  // (the scene update is manual, as in gz-sim)
+  scene->PreRender();
+  const auto now = std::chrono::steady_clock::duration::zero();
+  EXPECT_TRUE(sensors[0]->RenderAheadIfDue(now, true));
+  EXPECT_FALSE(sensors[1]->RenderAheadIfDue(now, true));
+  EXPECT_TRUE(sensors[0]->Update(now, true));
+  EXPECT_TRUE(sensors[1]->Update(now, true));
+
+  mgr.Remove(base->Id());
+  mgr.Remove(derived->Id());
+  engine->DestroyScene(scene);
+  gz::rendering::unloadEngine(engine->Name());
 }
 
 INSTANTIATE_TEST_SUITE_P(GpuLidarSensor, GpuLidarSensorTest,

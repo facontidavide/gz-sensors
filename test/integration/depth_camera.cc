@@ -15,8 +15,12 @@
  *
 */
 
+#include <chrono>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <thread>
+#include <vector>
 #include <gtest/gtest.h>
 
 #include <gz/msgs/camera_info.pb.h>
@@ -971,6 +975,81 @@ TEST_P(DepthCameraSensorTest, CustomCameraInfoTopic)
 {
   gz::common::Console::SetVerbosity(4);
   CustomCameraInfoTopic(GetParam());
+}
+
+//////////////////////////////////////////////////
+/// \brief A sensor type derived from DepthCameraSensor: its Update() may run
+/// code before it renders, so it does not render ahead.
+class DerivedDepthCameraSensor : public gz::sensors::DepthCameraSensor
+{
+};
+
+//////////////////////////////////////////////////
+TEST_P(DepthCameraSensorTest, RenderAheadOnlyExactType)
+{
+  const std::string renderEngine = GetParam();
+  if (renderEngine != "ogre2")
+  {
+    GTEST_SKIP() << "Engine '" << renderEngine << "' is not tested here";
+  }
+  auto *engine = gz::rendering::engine(renderEngine);
+  if (!engine)
+  {
+    GTEST_SKIP() << "Engine '" << renderEngine << "' is not supported";
+  }
+  gz::rendering::ScenePtr scene = engine->CreateScene("scene_render_ahead");
+  ASSERT_NE(nullptr, scene);
+
+  const std::string topic = "/test/integration/DepthCameraRenderAhead/image";
+  std::string path = gz::common::joinPaths(PROJECT_SOURCE_PATH, "test",
+      "sdf", "depth_camera_sensor_builtin.sdf");
+  sdf::SDFPtr doc(new sdf::SDF());
+  sdf::init(doc);
+  ASSERT_TRUE(sdf::readFile(path, doc));
+  auto sensorPtr = doc->Root()->GetElement("model")->GetElement("link")
+      ->GetElement("sensor");
+  sensorPtr->GetElement("topic")->Set<std::string>(topic);
+
+  gz::sensors::Manager mgr;
+  auto *base = mgr.CreateSensor<gz::sensors::DepthCameraSensor>(sensorPtr);
+  // (a camera name is unique in the scene)
+  sensorPtr->GetAttribute("name")->Set<std::string>("derived_depth_camera");
+  auto *derived = mgr.CreateSensor<DerivedDepthCameraSensor>(sensorPtr);
+  ASSERT_NE(nullptr, base);
+  ASSERT_NE(nullptr, derived);
+  // (Sensor::Update(_now, _force) is hidden in the sensor types)
+  const std::vector<gz::sensors::RenderingSensor *> sensors{base, derived};
+  for (gz::sensors::RenderingSensor *sensor : sensors)
+  {
+    sensor->SetScene(scene);
+    sensor->SetManualSceneUpdate(true);
+  }
+
+  // A subscriber: the depth camera renders ahead only for one.
+  gz::transport::Node node;
+  ASSERT_TRUE(node.Subscribe(topic,
+      std::function<void(const gz::msgs::Image &)>(
+          [](const gz::msgs::Image &) {})));
+  for (int i = 0; i < 500 && !(base->HasConnections() &&
+       derived->HasConnections()); ++i)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(base->HasConnections());
+  ASSERT_TRUE(derived->HasConnections());
+
+  // (the scene update is manual, as in gz-sim)
+  scene->PreRender();
+  const auto now = std::chrono::steady_clock::duration::zero();
+  EXPECT_TRUE(sensors[0]->RenderAheadIfDue(now, true));
+  EXPECT_FALSE(sensors[1]->RenderAheadIfDue(now, true));
+  EXPECT_TRUE(sensors[0]->Update(now, true));
+  EXPECT_TRUE(sensors[1]->Update(now, true));
+
+  mgr.Remove(base->Id());
+  mgr.Remove(derived->Id());
+  engine->DestroyScene(scene);
+  gz::rendering::unloadEngine(engine->Name());
 }
 
 INSTANTIATE_TEST_SUITE_P(DepthCameraSensor, DepthCameraSensorTest,
